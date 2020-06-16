@@ -1,8 +1,10 @@
 """Docstring coverage plugin for pytest using interrogate."""
 import os
+import re
 import warnings
 
 import pytest
+import attr
 from interrogate import config as interrogate_conf
 from interrogate import coverage as interrogate_cov
 
@@ -23,7 +25,13 @@ def validate_fail_under(num_str):
         value = int(num_str)
     except ValueError:
         value = float(num_str)
-    return min(value, 100)
+    if 1 <= value <= 100:
+        return value
+    raise ValueError(
+        "Not allowing docstring coverage below 1% to be tested. Should be between 1 and 100, not: {0}".format(
+            value
+        )
+    )
 
 
 def pytest_addoption(parser):
@@ -54,10 +62,10 @@ def pytest_addoption(parser):
         "--interrogate-ignore-regex", action="append", metavar="PATH", default=[], nargs="?",
     )
     group.addoption(
-        "--interrogate-whitelist-regex", action="append", metavar="PATH", default=[], nargs="?",
+        "--interrogate-include-regex", action="append", metavar="PATH", default=[], nargs="?",
     )
     group.addoption(
-        "--interrogate-exclude", action="append", metavar="PATH", default=[], nargs="?",
+        "--interrogate-exclude", action="append", metavar="PATH", default=(), nargs="?",
     )
     group.addoption("--interrogate-tofile", action="store", default=None, type=str)
     group.addoption(
@@ -67,7 +75,7 @@ def pytest_addoption(parser):
         help="Do not report interrogate if test run fails. " "Default: False",
     )
     group.addoption(
-        "--interrogate-disable",
+        "--interrogate-quiet",
         action="store_true",
         default=False,
         help="Disable interrogate completely (useful for debuggers). " "Default: False",
@@ -130,7 +138,7 @@ def pytest_addoption(parser):
     )
     group.addoption(
         "--interrogate-no-pyproject",
-        action="store_false",
+        action="store_true",
         help="Disable pyproject.toml if present. Default it uses pyproject.toml in cwd.",
         dest="interrogate_nopyproject",
     )
@@ -155,57 +163,50 @@ class PytestInterrogatePlugin(object):
         self.interrogate_covered = None
         self.options = options
         self.failed = False
-        self._disabled = getattr(options, "interrogate_disable", False)
-        if self._disabled:
-            return
         if not self.options.interrogate_source:
             return
-        interrogate_opts = {}
-        for option in {
-            "ignore_init_method",
-            "ignore_init_module",
-            "ignore_magic",
-            "ignore_module",
-            "ignore_nested_functions",
-            "ignore_private",
-            "ignore_semiprivate",
-            "fail_under",
-            "color",
-            "ignore_regex",
-            "whitelist_regex",
-        }:
-            opt_val = getattr(self.options, "interrogate_{0}".format(option))
-            if option.startswith("ignore") or option == "whitelist_regex":
-                if opt_val:
-                    interrogate_opts[option] = opt_val
-            elif option == "interrogate_color":
-                if not opt_val:
-                    interrogate_opts[option] = opt_val
-            elif opt_val != 80.0:
-                interrogate_opts[option] = opt_val
-        opts = None
+        opts = {}
         current_wd = os.getcwd()
         if not options.interrogate_nopyproject:
-            pyproject_file = interrogate.config.find_pyproject_toml(current_wd)
+            _ppf = os.path.join(current_wd, "pyproject.toml")
+            pyproject_file = _ppf if os.path.exists(_ppf) else None
             if pyproject_file:
-                opts = interrogate.config.parse_pyproject_toml(pyproject_file)
-        if opts:
-            opts.update(interrogate_opts)
-        else:
-            opts = interrogate_opts
+                opts = interrogate_conf.parse_pyproject_toml(pyproject_file)
+        for option in attr.fields_dict(interrogate_conf.InterrogateConfig):
+            iattr = "interrogate_{0}".format(option)
+            opt_val = getattr(self.options, iattr)
+            if option.startswith("ignore") or option == "include_regex":
+                if option.endswith("_regex"):
+                    cur_val = opts.get(option)
+                    if opt_val or cur_val:
+                        opt_val = [re.compile(regex) for regex in (opt_val or cur_val)]
+                if opt_val:
+                    opts[option] = opt_val
+            elif option == "color":
+                if option not in opts:
+                    opts[option] = True
+                if not opt_val:
+                    opts[option] = opt_val
+            elif opt_val != 80.0:
+                opts[option] = opt_val
+            setattr(self.options, iattr, opts.get(option) or opt_val)
+        self._disabled = getattr(options, "interrogate_quiet", opts.pop("quiet", False))
+        if self._disabled:
+            return
+        exclude = tuple(self.options.interrogate_exclude or opts.pop("exclude", ()))
+        self.options.interrogate_exclue = exclude
         if options.interrogate_source:
             if True in options.interrogate_source:
                 all_source = [current_wd]
             else:
                 all_source = [pth for pth in options.interrogate_source if pth is not True]
-        self.interrogate_config = interrogate_conf.InterrogateConfig(**opts)
+        self.options.interrogate_source = all_source
+        self.options.interrogate_verbose = opts.pop("verbose", self.options.interrogate_verbose)
+        self.interrogate_verbosity = self.options.interrogate_verbose
+        interrogate_config = interrogate_conf.InterrogateConfig(**opts)
         self.interrogate = interrogate_cov.InterrogateCoverage(
-            paths=all_source,
-            conf=self.interrogate_config,
-            excluded=self.options.interrogate_exclude,
+            paths=all_source, conf=interrogate_config, excluded=exclude,
         )
-        if self.options.interrogate_fail_under is None:
-            self.options.interrogate_fail_under = self.interrogate_config.fail_under
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_sessionfinish(self, session):
@@ -247,7 +248,7 @@ class PytestInterrogatePlugin(object):
             self.interrogate.print_results(
                 self.interrogate_results,
                 self.options.interrogate_tofile,
-                self.options.interrogate_verbose,
+                self.interrogate_verbosity,
             )
             output_formatter.tw.sep(
                 "=",
@@ -271,9 +272,9 @@ class PytestInterrogatePlugin(object):
                 fullwidth=output_formatter.TERMINAL_WIDTH,
                 **markup
             )
-            if self.options.interrogate_verbose > 1:
+            if self.interrogate_verbosity > 1:
                 self.interrogate._print_detailed_table(self.interrogate_results)
-            elif self.options.interrogate_verbose > 0:
+            elif self.interrogate_verbosity > 0:
                 self.interrogate._print_summary_table(self.interrogate_results)
                 output_formatter.tw.sep("-", title="", fullwidth=output_formatter.TERMINAL_WIDTH)
             message = (
